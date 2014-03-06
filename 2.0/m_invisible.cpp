@@ -17,10 +17,18 @@
 /* $ModDesc: Allows for opered clients to join channels without being seen, similar to unreal 3.1 +I mode */
 /* $ModDepends: core 2.0 */
 
+enum HideEnum
+{
+	HIDE_CHAN = 0,
+	HIDE_FULL = 1
+};
+
 class InvisibleMode : public ModeHandler
 {
+	HideEnum& hidelevel;
+
  public:
-	InvisibleMode(Module* Creator) : ModeHandler(Creator, "invis-oper", 'Q', PARAM_NONE, MODETYPE_USER)
+	InvisibleMode(Module* Creator, HideEnum& hidel) : ModeHandler(Creator, "invis-oper", 'Q', PARAM_NONE, MODETYPE_USER), hidelevel(hidel)
 	{
 		oper = true;
 	}
@@ -68,6 +76,9 @@ class InvisibleMode : public ModeHandler
 				}
 			}
 
+			if (adding && hidelevel == HIDE_FULL)
+				dest->ForceNickChange(dest->uuid.c_str());
+
 			ServerInstance->SNO->WriteToSnoMask('a', "\2NOTICE\2: Oper %s has become %svisible (%cQ)", dest->GetFullHost().c_str(), adding ? "in" : "", adding ? '+' : '-');
 			return MODEACTION_ALLOW;
 		}
@@ -82,12 +93,13 @@ class ModuleInvisible : public Module
 {
  private:
 	InvisibleMode qm;
-	bool hidejoin;
-	bool hidelist;
-	bool hidewho;
-	bool hidemsg;
+	HideEnum HideLevel;
+
+	bool override_active;
+	bool safety;
+
  public:
-	ModuleInvisible() : qm(this)
+	ModuleInvisible() : qm(this, HideLevel), override_active(false)
 	{
 	}
 
@@ -100,7 +112,8 @@ class ModuleInvisible : public Module
 		Implementation eventlist[] = {
 			I_OnUserPreMessage, I_OnUserPreNotice, I_OnUserJoin,
 			I_OnBuildNeighborList, I_OnSendWhoLine, I_OnNamesListItem,
-			I_OnRehash
+			I_OnRehash, I_OnUserPreNotice, I_OnWhoisLine, I_OnRawMode,
+			I_OnPreMode, I_OnUserPreNick, I_OnUserPart, I_OnStats, I_OnUserPreKick
 		};
 		ServerInstance->Modules->Attach(eventlist, this, sizeof(eventlist)/sizeof(Implementation));
 		OnRehash(NULL);
@@ -109,83 +122,207 @@ class ModuleInvisible : public Module
 	void OnRehash(User*)
 	{
 		ConfigTag* tag = ServerInstance->Config->ConfValue("invisible");
-		hidejoin = tag->getBool("join");
-		hidelist = tag->getBool("list");
-		hidewho = tag->getBool("who");
-		hidemsg = tag->getBool("msg");
+		safety = tag->getBool("safe", false);
+		HideLevel = tag->getBool("full", false) ? HIDE_FULL : HIDE_CHAN;
 	}
-	Version GetVersion();
-	void OnUserJoin(Membership* memb, bool sync, bool created, CUList& excepts);
-	void OnBuildNeighborList(User* source, UserChanList &include, std::map<User*,bool> &exceptions);
-	ModResult OnUserPreNotice(User* user,void* dest,int target_type, std::string &text, char status, CUList &exempt_list);
-	ModResult OnUserPreMessage(User* user,void* dest,int target_type, std::string &text, char status, CUList &exempt_list);
-	void OnSendWhoLine(User* source, const std::vector<std::string>&, User* user, std::string& line);
-	void OnNamesListItem(User* issuer, Membership* memb, std::string &prefixes, std::string &nick);
-};
 
-Version ModuleInvisible::GetVersion()
-{
-	return Version("Allows opers to join channels invisibly", VF_COMMON);
-}
-
-static void BuildExcept(Membership* memb, CUList& excepts)
-{
-	const UserMembList* users = memb->chan->GetUsers();
-	for(UserMembCIter i = users->begin(); i != users->end(); i++)
+	Version GetVersion()
 	{
-		if (IS_LOCAL(i->first) && i->first->HasPrivPermission("invisible/see"))
-			excepts.insert(i->first);
+		return Version("Allows opers to join channels invisibly", VF_COMMON);
 	}
-}
 
-void ModuleInvisible::OnUserJoin(Membership* memb, bool sync, bool created, CUList& excepts)
-{
-	if (hidejoin && memb->user->IsModeSet('Q'))
+	static void BuildExcept(Membership* memb, CUList& excepts)
 	{
-		BuildExcept(memb, excepts);
-		ServerInstance->SNO->WriteToSnoMask('a', "\2NOTICE\2: Oper %s has joined %s invisibly (+Q)",
-			memb->user->GetFullHost().c_str(), memb->chan->name.c_str());
+		const UserMembList* users = memb->chan->GetUsers();
+		for(UserMembCIter i = users->begin(); i != users->end(); i++)
+			if (memb->user != i->first && IS_LOCAL(i->first) && !i->first->HasPrivPermission("invisible/see"))
+				excepts.insert(i->first);
 	}
-}
 
-void ModuleInvisible::OnBuildNeighborList(User* source, UserChanList &include, std::map<User*,bool> &exceptions)
-{
-	if (hidewho && source->IsModeSet('Q'))
+	void OnUserJoin(Membership* memb, bool sync, bool created, CUList& excepts)
 	{
-		include.clear();
-	}
-}
-
-/* No privmsg response when hiding - submitted by Eric at neowin */
-ModResult ModuleInvisible::OnUserPreNotice(User* user,void* dest,int target_type, std::string &text, char status, CUList &exempt_list)
-{
-	if ((target_type == TYPE_USER) && (IS_LOCAL(user)))
-	{
-		User* target = (User*)dest;
-		if(hidemsg && target->IsModeSet('Q') && !IS_OPER(user))
+		if (memb->user->IsModeSet('Q'))
 		{
-			user->WriteNumeric(401, "%s %s :No such nick/channel",user->nick.c_str(), target->nick.c_str());
-			return MOD_RES_DENY;
+			BuildExcept(memb, excepts);
+			ServerInstance->SNO->WriteToSnoMask('a', "\2NOTICE\2: Oper %s has joined %s invisibly (+Q)",
+				memb->user->GetFullHost().c_str(), memb->chan->name.c_str());
 		}
 	}
-	return MOD_RES_PASSTHRU;
-}
 
-ModResult ModuleInvisible::OnUserPreMessage(User* user,void* dest,int target_type, std::string &text, char status, CUList &exempt_list)
-{
-	return OnUserPreNotice(user, dest, target_type, text, status, exempt_list);
-}
+	void OnUserPart(Membership* memb, std::string& partmessage, CUList& except_list)
+	{
+		if (memb->user->IsModeSet('Q'))
+			BuildExcept(memb, except_list);
+	}
 
-void ModuleInvisible::OnSendWhoLine(User* source, const std::vector<std::string>& params, User* user, std::string& line)
-{
-	if (hidewho && user->IsModeSet('Q') && !IS_OPER(source))
-		line.clear();
-}
+	void OnBuildNeighborList(User* source, UserChanList &include, std::map<User*,bool> &exceptions)
+	{
+		if (HideLevel == HIDE_FULL && source->IsModeSet('Q'))
+			include.clear();
+	}
 
-void ModuleInvisible::OnNamesListItem(User* issuer, Membership* memb, std::string &prefixes, std::string &nick)
-{
-	if (hidelist && memb->user->IsModeSet('Q') && !IS_OPER(issuer))
-		nick.clear();
-}
+	ModResult OnUserPreKick(User* source, Membership* memb, const std::string& reason)
+	{
+		if (!IS_LOCAL(source) || !memb->user->IsModeSet('Q'))
+			return MOD_RES_PASSTHRU;
+
+		source->WriteNumeric(401, "%s %s :No such nick/channel", source->nick.c_str(), memb->user->nick.c_str());
+		return MOD_RES_DENY;
+	}
+
+	ModResult OnStats(char symbol, User* user, std::vector<std::string>& results)
+	{
+		if (HideLevel != HIDE_FULL || symbol != 'P' || IS_OPER(user))
+			return MOD_RES_PASSTHRU;
+
+		// Steal some logic from cmd_stats.cpp
+		unsigned int idx = 0;
+		std::string sn(ServerInstance->Config->ServerName);
+		for (std::list<User*>::const_iterator i = ServerInstance->Users->all_opers.begin(); i != ServerInstance->Users->all_opers.end(); ++i)
+		{
+			User* oper = *i;
+			if (!ServerInstance->ULine(oper->server) && !oper->IsModeSet('Q'))
+			{
+				results.push_back(sn+" 249 " + user->nick + " :" + oper->nick + " (" + oper->ident + "@" + oper->dhost + ") Idle: " +
+						(IS_LOCAL(oper) ? ConvToStr(ServerInstance->Time() - oper->idle_lastmsg) + " secs" : "unavailable"));
+				idx++;
+			}
+		}
+		results.push_back(sn+" 249 "+user->nick+" :"+ConvToStr(idx)+" OPER(s)");
+
+		return MOD_RES_DENY;
+	}
+
+	ModResult OnUserPreNick(User* user, const std::string& newnick)
+	{
+		if (IS_LOCAL(user) && HideLevel == HIDE_FULL && user->IsModeSet('Q') && newnick != user->uuid)
+			return MOD_RES_DENY;
+
+		return MOD_RES_PASSTHRU;
+	}
+
+	ModResult OnRawMode(User* user, Channel* chan, const char mode, const std::string& param, bool adding, int pcnt)
+	{
+		if (override_active || !chan | !IS_LOCAL(user))
+			return MOD_RES_PASSTHRU;
+
+		User* nick = ServerInstance->FindNick(param);
+		ModeHandler* mh = ServerInstance->Modes->FindMode(mode, MODETYPE_CHANNEL);
+		if (!nick || !mh->GetPrefixRank())
+			return MOD_RES_PASSTHRU;
+
+		if (nick->IsModeSet('Q'))
+		{
+			user->WriteNumeric(401, "%s %s :No such nick/channel",user->nick.c_str(), param.c_str());
+			return MOD_RES_DENY;
+		}
+
+		return MOD_RES_PASSTHRU;
+	}
+
+	ModResult OnPreMode(User* source, User* dest, Channel* channel, const std::vector<std::string>& parameters)
+	{
+		if (override_active || !IS_LOCAL(source))
+			return MOD_RES_PASSTHRU;
+
+		if (safety && channel && source->IsModeSet('Q'))
+		{
+			if (parameters.size() < 2 || parameters[1] != "!")
+			{
+				source->WriteServ("NOTICE %s :*** Blocked message. You are hidden and safety is on. Place ' ! ' between channel and modes to override.", source->nick.c_str());
+				return MOD_RES_DENY;
+			}
+
+			std::vector<std::string> params = parameters;
+			params.erase(params.begin() + 1);
+			override_active = true;
+			ServerInstance->Modes->Process(params, source);
+			override_active = false;
+			return MOD_RES_DENY;
+		}
+		return MOD_RES_PASSTHRU;
+	}
+
+	ModResult OnWhoisLine(User* user, User* dest, int& numeric, std::string& text)
+	{
+		if (IS_OPER(user) || !dest->IsModeSet('Q'))
+			return MOD_RES_PASSTHRU;
+
+		if (numeric == 318)
+			return MOD_RES_PASSTHRU;
+
+		if (HideLevel == HIDE_FULL || numeric == 319)
+			return MOD_RES_DENY;
+		
+		return MOD_RES_PASSTHRU;
+	}
+
+	/* No privmsg response when hiding - submitted by Eric at neowin */
+	ModResult OnUserPreNotice(User* user,void* dest,int target_type, std::string &text, char status, CUList &exempt_list)
+	{
+		if (HideLevel == HIDE_FULL && IS_LOCAL(user) && user->IsModeSet('Q'))
+		{
+			// Don't block messages to other opers
+			if (target_type == TYPE_USER && IS_OPER(static_cast<User*>(dest)))
+				return MOD_RES_PASSTHRU;
+
+			if (text[0] != '!')
+			{
+				user->WriteServ("NOTICE %s :*** Blocked message. You are hidden and safety is on. Prefix message with ! to override.", user->nick.c_str());
+				return MOD_RES_DENY;
+			}
+			text = text.substr(1);
+		}
+		else if ((target_type == TYPE_USER) && (IS_LOCAL(user)))
+		{
+			User* target = (User*)dest;
+			if(HideLevel == HIDE_FULL && target->IsModeSet('Q') && !IS_OPER(user))
+			{
+				user->WriteNumeric(401, "%s %s :No such nick/channel",user->nick.c_str(), target->nick.c_str());
+				return MOD_RES_DENY;
+			}
+		}
+		return MOD_RES_PASSTHRU;
+	}
+
+	ModResult OnUserPreMessage(User* user,void* dest,int target_type, std::string &text, char status, CUList &exempt_list)
+	{
+		return OnUserPreNotice(user, dest, target_type, text, status, exempt_list);
+	}
+
+	void OnSendWhoLine(User* source, const std::vector<std::string>& params, User* user, std::string& line)
+	{
+		if (!user->IsModeSet('Q') || IS_OPER(source))
+			return;
+		if (HideLevel != HIDE_FULL)
+		{
+			// Filthy stealing from cmd_who - easier than reliably just swapping out the parts we dont' care about
+			line = "352 " + source->nick + " " + "*" + " " + user->ident + " " +
+				(source->HasPrivPermission("users/auspex") ? user->host : user->dhost) + " ";
+			if (!ServerInstance->Config->HideWhoisServer.empty() && !source->HasPrivPermission("servers/auspex"))
+				line.append(ServerInstance->Config->HideWhoisServer);
+			else
+				line.append(user->server);
+	
+			line.append(" " + user->nick + " ");
+
+			line += IS_AWAY(user) ? "G" : "H";
+
+			if (IS_OPER(user))
+				line.push_back('*');
+
+			line.append(" :0 " + user->fullname);
+		}
+		else
+			line.clear();
+		
+	}
+
+	void OnNamesListItem(User* issuer, Membership* memb, std::string &prefixes, std::string &nick)
+	{
+		if (memb->user->IsModeSet('Q') && !IS_OPER(issuer))
+			nick.clear();
+	}
+};
 
 MODULE_INIT(ModuleInvisible)
